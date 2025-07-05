@@ -18,6 +18,93 @@ from colabdesign.af.alphafold.common import protein, residue_constants
 aa_order = residue_constants.restype_order
 order_aa = {b:a for a,b in aa_order.items()}
 
+def prep_pdb_from_string(pdb_string, chain=None,
+                         offsets=None, lengths=None,
+                         ignore_missing=False):
+    '''
+    Extracts features from a PDB-formatted string.
+    Identical to prep_pdb, but takes a string instead of a filename.
+    '''
+
+    def add_cb(batch):
+        '''add missing CB atoms based on N,CA,C'''
+        p, m = batch["all_atom_positions"], batch["all_atom_mask"]
+        atom_idx = residue_constants.atom_order
+        atoms = {k: p[..., atom_idx[k], :] for k in ["N", "CA", "C"]}
+        cb = atom_idx["CB"]
+        cb_atoms = _np_get_cb(**atoms, use_jax=False)
+        cb_mask = np.prod([m[..., atom_idx[k]] for k in ["N", "CA", "C"]], 0)
+        batch["all_atom_positions"][..., cb, :] = np.where(m[:, cb, None], p[:, cb, :], cb_atoms)
+        batch["all_atom_mask"][..., cb] = (m[:, cb] + cb_mask) > 0
+        return {"atoms": batch["all_atom_positions"][:, cb], "mask": cb_mask}
+
+    if isinstance(chain, str) and "," in chain:
+        chains = chain.split(",")
+    elif chain is None:
+        # If no chain is specified, parse all unique chains from the PDB string
+        chains = sorted(list(set(line[21] for line in pdb_string.splitlines() if line.startswith("ATOM"))))
+    elif not isinstance(chain, list):
+        chains = [chain]
+
+    o, last = [], 0
+    residue_idx, chain_idx = [], []
+    full_lengths = []
+
+    # go through each defined chain
+    for n, chain_id in enumerate(chains):
+        # Directly parse the provided PDB string for the specified chain
+        protein_obj = protein.from_pdb_string(pdb_string, chain_id=chain_id)
+        batch = {'aatype': protein_obj.aatype,
+                 'all_atom_positions': protein_obj.atom_positions,
+                 'all_atom_mask': protein_obj.atom_mask,
+                 'residue_index': protein_obj.residue_index}
+
+        cb_feat = add_cb(batch)  # add in missing cb (in the case of glycine)
+
+        im = ignore_missing[n] if isinstance(ignore_missing, list) else ignore_missing
+        if im:
+            r = batch["all_atom_mask"][:, 0] == 1
+            batch = jax.tree_util.tree_map(lambda x: x[r], batch)
+            residue_index = batch["residue_index"] + last
+
+        else:
+            # pad values
+            offset = 0 if offsets is None else (offsets[n] if isinstance(offsets, list) else offsets)
+            r = offset + (protein_obj.residue_index - protein_obj.residue_index.min())
+            length = (r.max() + 1) if lengths is None else (lengths[n] if isinstance(lengths, list) else lengths)
+            def scatter(x, value=0):
+                shape = (length,) + x.shape[1:]
+                y = np.full(shape, value, dtype=x.dtype)
+                y[r] = x
+                return y
+
+            batch = {"aatype": scatter(batch["aatype"], -1),
+                     "all_atom_positions": scatter(batch["all_atom_positions"]),
+                     "all_atom_mask": scatter(batch["all_atom_mask"]),
+                     "residue_index": scatter(batch["residue_index"], -1)}
+
+            residue_index = np.arange(length) + last
+
+        last = residue_index[-1] + 50
+        o.append({"batch": batch,
+                  "residue_index": residue_index,
+                  "cb_feat": cb_feat})
+
+        residue_idx.append(batch.pop("residue_index"))
+        chain_idx.append([chain_id] * len(residue_idx[-1]))
+        full_lengths.append(len(residue_index))
+
+    # concatenate chains
+    if not o:
+        raise ValueError("No protein data was processed. Check if the PDB string is valid and the chain ID(s) exist.")
+
+    o = jax.tree_util.tree_map(lambda *x: np.concatenate(x, 0), *o)
+
+    # save original residue and chain index
+    o["idx"] = {"residue": np.concatenate(residue_idx), "chain": np.concatenate(chain_idx)}
+    o["lengths"] = full_lengths
+    return o
+
 class mk_mpnn_model():
   def __init__(self, model_name="v_48_020",
                backbone_noise=0.0, dropout=0.0,
@@ -50,13 +137,19 @@ class mk_mpnn_model():
     self._num = 1
     self._inputs = {}
     self._tied_lengths = False
+  def prep_inputs(self, pdb_filename=None, pdb_string=None, chain=None, homooligomer=False,
+                    ignore_missing=True, fix_pos=None, inverse=False,
+                    rm_aa=None, verbose=False, **kwargs):  
+      '''Get inputs from a PDB file or a PDB-formatted string.'''
+        
+    if pdb_string is not None:
+        pdb = prep_pdb_from_string(pdb_string, chain=chain, ignore_missing=ignore_missing)
+    elif pdb_filename is not None:
+        # Use the original prep_pdb for file-based input
+        pdb = prep_pdb(pdb_filename, chain=chain, ignore_missing=ignore_missing)
+    else:
+        raise ValueError("Either 'pdb_filename' or 'pdb_string' must be provided.")
 
-  def prep_inputs(self, pdb_filename=None, chain=None, homooligomer=False,
-                  ignore_missing=True, fix_pos=None, inverse=False,
-                  rm_aa=None, verbose=False, **kwargs):
-    
-    '''get inputs from input pdb'''
-    pdb = prep_pdb(pdb_filename, chain, ignore_missing=ignore_missing)
     atom_idx = tuple(residue_constants.atom_order[k] for k in ["N","CA","C","O"])
     chain_idx = np.concatenate([[n]*l for n,l in enumerate(pdb["lengths"])])
     self._lengths = pdb["lengths"]
