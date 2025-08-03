@@ -204,7 +204,7 @@ class ProteinFeatures(hk.Module):
     D = jnp.sqrt(jnp.square(dX).sum(-1) + eps)
     D_masked = jnp.where(mask_2D,D,D.max(-1,keepdims=True))
     k = min(self.top_k, X.shape[-2])
-    return jax.lax.approx_min_k(D_masked, k, reduction_dimension=-1)[1]
+    return jax.lax.top_k(-D_masked, k)[1]
 
   def _rbf(self, D):
     ''' radial basis function (RBF)
